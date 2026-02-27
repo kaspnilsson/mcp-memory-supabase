@@ -1,84 +1,12 @@
-import { Entity, Relation, KnowledgeGraph, SearchMatch } from "./types.js";
-
-interface Database {
-  public: {
-    Tables: {
-      entities: {
-        Row: {
-          id: number;
-          name: string;
-          entity_type: string;
-          embedding: number[] | null;
-        };
-        Insert: {
-          id?: number;
-          name: string;
-          entity_type: string;
-          embedding?: number[] | null;
-        };
-        Update: {
-          id?: number;
-          name?: string;
-          entity_type?: string;
-          embedding?: number[] | null;
-        };
-      };
-      observations: {
-        Row: {
-          id: number;
-          entity_id: number;
-          content: string;
-        };
-        Insert: {
-          id?: number;
-          entity_id: number;
-          content: string;
-        };
-        Update: {
-          id?: number;
-          entity_id?: number;
-          content?: string;
-        };
-      };
-      relations: {
-        Row: {
-          id: number;
-          from_entity_id: number;
-          to_entity_id: number;
-          relation_type: string;
-        };
-        Insert: {
-          id?: number;
-          from_entity_id: number;
-          to_entity_id: number;
-          relation_type: string;
-        };
-        Update: {
-          id?: number;
-          from_entity_id?: number;
-          to_entity_id?: number;
-          relation_type?: string;
-        };
-      };
-    };
-    Functions: {
-      match_entities: {
-        Args: {
-          query_embedding: number[];
-          match_count: number;
-        };
-        Returns: Array<{
-          id: number;
-          name: string;
-          entity_type: string;
-          similarity: number;
-        }>;
-      };
-    };
-  };
-}
-
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { Entity, Relation, KnowledgeGraph, SearchMatch, Logger, createDefaultLogger } from "./types.js";
+
+interface MatchResult {
+  id: number;
+  name: string;
+  entity_type: string;
+  similarity: number;
+}
 
 export interface KnowledgeGraphManagerConfig {
   supabaseUrl: string;
@@ -86,19 +14,29 @@ export interface KnowledgeGraphManagerConfig {
   embeddingApiKey?: string;
   embeddingApiUrl?: string;
   embeddingModel?: string;
+  logger?: Logger;
+}
+
+const DEFAULT_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings";
+const DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small";
+
+function escapeLikePattern(str: string): string {
+  return str.replace(/[%_\\]/g, "\\$&");
 }
 
 export class KnowledgeGraphManager {
-  private readonly supabase: SupabaseClient<Database>;
+  private readonly supabase: SupabaseClient;
   private readonly embeddingApiKey?: string;
   private readonly embeddingApiUrl: string;
   private readonly embeddingModel: string;
+  private readonly logger: Logger;
 
   public constructor(config: KnowledgeGraphManagerConfig) {
-    this.supabase = createClient<Database>(config.supabaseUrl, config.supabaseKey);
+    this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
     this.embeddingApiKey = config.embeddingApiKey;
-    this.embeddingApiUrl = config.embeddingApiUrl ?? "https://openrouter.ai/api/v1/embeddings";
-    this.embeddingModel = config.embeddingModel ?? "openai/text-embedding-3-small";
+    this.embeddingApiUrl = config.embeddingApiUrl ?? DEFAULT_EMBEDDING_URL;
+    this.embeddingModel = config.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
+    this.logger = config.logger ?? createDefaultLogger();
   }
 
   private async getEmbedding(text: string): Promise<number[] | null> {
@@ -120,18 +58,21 @@ export class KnowledgeGraphManager {
       });
 
       if (!res.ok) {
+        this.logger.warn("Embedding API request failed", { status: res.status });
         return null;
       }
 
       const data = (await res.json()) as { data?: { embedding?: number[] }[] };
       return data.data?.[0]?.embedding ?? null;
-    } catch {
+    } catch (err) {
+      this.logger.error("Embedding API error", { error: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }
 
   public async createEntities(entities: Entity[]): Promise<Entity[]> {
     const created: Entity[] = [];
+    const errors: string[] = [];
 
     for (const entity of entities) {
       const text = `${entity.name}: ${entity.observations.join(". ")}`;
@@ -151,6 +92,8 @@ export class KnowledgeGraphManager {
         .single();
 
       if (error !== null || data === null) {
+        this.logger.warn("Failed to create entity", { name: entity.name, error: error?.message });
+        errors.push(`Failed to create entity "${entity.name}": ${error?.message ?? "unknown error"}`);
         continue;
       }
 
@@ -164,12 +107,15 @@ export class KnowledgeGraphManager {
         const newObservations = entity.observations.filter((o) => !existingContents.has(o));
 
         if (newObservations.length > 0) {
-          await this.supabase.from("observations").insert(
+          const { error: obsError } = await this.supabase.from("observations").insert(
             newObservations.map((content) => ({
               entity_id: data.id,
               content,
             }))
           );
+          if (obsError !== null) {
+            this.logger.warn("Failed to insert observations", { entityId: data.id, error: obsError.message });
+          }
         }
       }
 
@@ -183,6 +129,10 @@ export class KnowledgeGraphManager {
         entityType: entity.entityType,
         observations: (obs ?? []).map((o) => o.content),
       });
+    }
+
+    if (errors.length > 0) {
+      this.logger.warn("create_entities completed with errors", { errors, createdCount: created.length });
     }
 
     return created;
@@ -205,6 +155,12 @@ export class KnowledgeGraphManager {
         .single();
 
       if (fromEntity === null || toEntity === null) {
+        this.logger.warn("Skipping relation - entity not found", {
+          from: relation.from,
+          to: relation.to,
+          fromFound: fromEntity !== null,
+          toFound: toEntity !== null,
+        });
         continue;
       }
 
@@ -217,9 +173,12 @@ export class KnowledgeGraphManager {
         { onConflict: "from_entity_id,to_entity_id,relation_type" }
       );
 
-      if (error === null) {
-        created.push(relation);
+      if (error !== null) {
+        this.logger.warn("Failed to create relation", { from: relation.from, to: relation.to, error: error.message });
+        continue;
       }
+
+      created.push(relation);
     }
 
     return created;
@@ -238,7 +197,7 @@ export class KnowledgeGraphManager {
         .single();
 
       if (entity === null) {
-        throw new Error(`Entity with name ${obs.entityName} not found`);
+        throw new Error(`Entity with name "${obs.entityName}" not found`);
       }
 
       const { data: existing } = await this.supabase
@@ -250,17 +209,34 @@ export class KnowledgeGraphManager {
       const newObservations = obs.contents.filter((c) => !existingContents.has(c));
 
       if (newObservations.length > 0) {
-        await this.supabase.from("observations").insert(
+        const { error: insertError } = await this.supabase.from("observations").insert(
           newObservations.map((content) => ({
             entity_id: entity.id,
             content,
           }))
         );
 
-        const text = `${obs.entityName}: ${newObservations.join(". ")}`;
+        if (insertError !== null) {
+          this.logger.error("Failed to insert observations", { entityId: entity.id, error: insertError.message });
+          throw new Error(`Failed to add observations to "${obs.entityName}": ${insertError.message}`);
+        }
+
+        const { data: allObservations } = await this.supabase
+          .from("observations")
+          .select("content")
+          .eq("entity_id", entity.id);
+
+        const allContents = (allObservations ?? []).map((o) => o.content);
+        const text = `${obs.entityName}: ${allContents.join(". ")}`;
         const embedding = await this.getEmbedding(text);
         if (embedding !== null) {
-          await this.supabase.from("entities").update({ embedding }).eq("id", entity.id);
+          const { error: updateError } = await this.supabase
+            .from("entities")
+            .update({ embedding })
+            .eq("id", entity.id);
+          if (updateError !== null) {
+            this.logger.warn("Failed to update embedding", { entityId: entity.id, error: updateError.message });
+          }
         }
       }
 
@@ -273,15 +249,39 @@ export class KnowledgeGraphManager {
     return results;
   }
 
-  public async deleteEntities(entityNames: string[]): Promise<void> {
+  public async deleteEntities(entityNames: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    const deleted: string[] = [];
+    const notFound: string[] = [];
+
     for (const name of entityNames) {
-      await this.supabase.from("entities").delete().ilike("name", name);
+      const { data: entity } = await this.supabase
+        .from("entities")
+        .select("name")
+        .ilike("name", name)
+        .single();
+
+      if (entity === null) {
+        notFound.push(name);
+        continue;
+      }
+
+      const { error } = await this.supabase.from("entities").delete().eq("name", entity.name);
+      if (error !== null) {
+        this.logger.warn("Failed to delete entity", { name, error: error.message });
+        notFound.push(name);
+      } else {
+        deleted.push(entity.name);
+      }
     }
+
+    return { deleted, notFound };
   }
 
   public async deleteObservations(
     deletions: { entityName: string; observations: string[] }[]
-  ): Promise<void> {
+  ): Promise<{ entityName: string; deletedCount: number }[]> {
+    const results: { entityName: string; deletedCount: number }[] = [];
+
     for (const del of deletions) {
       const { data: entity } = await this.supabase
         .from("entities")
@@ -290,16 +290,33 @@ export class KnowledgeGraphManager {
         .single();
 
       if (entity !== null) {
-        await this.supabase
+        const { data: deleted, error } = await this.supabase
           .from("observations")
           .delete()
           .eq("entity_id", entity.id)
-          .in("content", del.observations);
+          .in("content", del.observations)
+          .select("id");
+
+        results.push({
+          entityName: del.entityName,
+          deletedCount: deleted?.length ?? 0,
+        });
+
+        if (error !== null) {
+          this.logger.warn("Error deleting observations", { entityName: del.entityName, error: error.message });
+        }
+      } else {
+        results.push({ entityName: del.entityName, deletedCount: 0 });
       }
     }
+
+    return results;
   }
 
-  public async deleteRelations(relations: Relation[]): Promise<void> {
+  public async deleteRelations(relations: Relation[]): Promise<{ deleted: number; notFound: number }> {
+    let deleted = 0;
+    let notFound = 0;
+
     for (const rel of relations) {
       const { data: fromEntity } = await this.supabase
         .from("entities")
@@ -313,28 +330,56 @@ export class KnowledgeGraphManager {
         .ilike("name", rel.to)
         .single();
 
-      if (fromEntity !== null && toEntity !== null) {
-        await this.supabase.from("relations").delete().match({
-          from_entity_id: fromEntity.id,
-          to_entity_id: toEntity.id,
-          relation_type: rel.relationType,
-        });
+      if (fromEntity === null || toEntity === null) {
+        notFound++;
+        continue;
+      }
+
+      const { error } = await this.supabase.from("relations").delete().match({
+        from_entity_id: fromEntity.id,
+        to_entity_id: toEntity.id,
+        relation_type: rel.relationType,
+      });
+
+      if (error !== null) {
+        this.logger.warn("Failed to delete relation", { from: rel.from, to: rel.to, error: error.message });
+        notFound++;
+      } else {
+        deleted++;
       }
     }
+
+    return { deleted, notFound };
   }
 
   public async readGraph(): Promise<KnowledgeGraph> {
-    const { data: entities } = await this.supabase
+    const { data: entities, error: entitiesError } = await this.supabase
       .from("entities")
       .select("id, name, entity_type");
 
-    const { data: observations } = await this.supabase
+    if (entitiesError !== null) {
+      this.logger.error("Failed to fetch entities", { error: entitiesError.message });
+      return { entities: [], relations: [] };
+    }
+
+    const { data: observations, error: obsError } = await this.supabase
       .from("observations")
       .select("entity_id, content");
 
-    const { data: relations } = await this.supabase
+    if (obsError !== null) {
+      this.logger.error("Failed to fetch observations", { error: obsError.message });
+    }
+
+    const entityIds = (entities ?? []).map((e) => e.id);
+    const { data: relations, error: relError } = await this.supabase
       .from("relations")
-      .select("from_entity_id, to_entity_id, relation_type");
+      .select("from_entity_id, to_entity_id, relation_type")
+      .in("from_entity_id", entityIds)
+      .in("to_entity_id", entityIds);
+
+    if (relError !== null) {
+      this.logger.error("Failed to fetch relations", { error: relError.message });
+    }
 
     const entityMap = new Map<number, { name: string; entityType: string; observations: string[] }>(
       (entities ?? []).map((e) => [e.id, { name: e.name, entityType: e.entity_type, observations: [] }])
@@ -378,19 +423,20 @@ export class KnowledgeGraphManager {
       match_count: 20,
     });
 
-    if (error !== null || data === null) {
+    if (error !== null || data === null || data.length === 0) {
+      this.logger.warn("Vector search failed, falling back to text search", { error: error?.message });
       return this.fallbackSearch(query);
     }
 
-    const entityIds = new Set(data.map((m) => m.id));
-    const entityNames = new Set(data.map((m) => m.name));
+    const entityIds = data.map((m: MatchResult) => m.id);
+    const entityNames = new Set(data.map((m: MatchResult) => m.name));
 
     const { data: observations } = await this.supabase
       .from("observations")
       .select("entity_id, content")
-      .in("entity_id", Array.from(entityIds));
+      .in("entity_id", entityIds);
 
-    const entityMap = new Map<string, Entity & { similarity?: number }>();
+    const entityMap = new Map<string, SearchMatch>();
 
     for (const match of data) {
       entityMap.set(match.name, {
@@ -398,11 +444,11 @@ export class KnowledgeGraphManager {
         entityType: match.entity_type,
         observations: [],
         similarity: match.similarity,
-      } as SearchMatch);
+      });
     }
 
     for (const obs of observations ?? []) {
-      const matchingEntity = data.find((m) => m.id === obs.entity_id);
+      const matchingEntity = data.find((m: MatchResult) => m.id === obs.entity_id);
       if (matchingEntity !== undefined) {
         const entity = entityMap.get(matchingEntity.name);
         if (entity !== undefined) {
@@ -413,9 +459,11 @@ export class KnowledgeGraphManager {
 
     const { data: relations } = await this.supabase
       .from("relations")
-      .select("from_entity_id, to_entity_id, relation_type");
+      .select("from_entity_id, to_entity_id, relation_type")
+      .in("from_entity_id", entityIds)
+      .in("to_entity_id", entityIds);
 
-    const idToName = new Map<number, string>(data.map((m) => [m.id, m.name]));
+    const idToName = new Map<number, string>(data.map((m: MatchResult) => [m.id, m.name]));
 
     const filteredRelations: Relation[] = (relations ?? [])
       .map((r): Relation | null => {
@@ -435,28 +483,32 @@ export class KnowledgeGraphManager {
   }
 
   private async fallbackSearch(query: string): Promise<KnowledgeGraph> {
+    const escapedQuery = escapeLikePattern(query);
+
     const { data: entities } = await this.supabase
       .from("entities")
       .select("id, name, entity_type")
-      .or(`name.ilike.%${query}%,entity_type.ilike.%${query}%`);
+      .or(`name.ilike.%${escapedQuery}%,entity_type.ilike.%${escapedQuery}%`);
 
     const { data: matchingObs } = await this.supabase
       .from("observations")
       .select("entity_id")
-      .ilike("content", `%${query}%`);
+      .ilike("content", `%${escapedQuery}%`);
 
     const obsEntityIds = new Set((matchingObs ?? []).map((o) => o.entity_id));
 
     const allEntities = [...(entities ?? [])];
     if (obsEntityIds.size > 0) {
-      const { data: additionalEntities } = await this.supabase
-        .from("entities")
-        .select("id, name, entity_type")
-        .in("id", Array.from(obsEntityIds));
-
       const existingIds = new Set(allEntities.map((e) => e.id));
-      for (const e of additionalEntities ?? []) {
-        if (!existingIds.has(e.id)) {
+      const additionalIds = Array.from(obsEntityIds).filter((id) => !existingIds.has(id));
+
+      if (additionalIds.length > 0) {
+        const { data: additionalEntities } = await this.supabase
+          .from("entities")
+          .select("id, name, entity_type")
+          .in("id", additionalIds);
+
+        for (const e of additionalEntities ?? []) {
           allEntities.push(e);
         }
       }
@@ -466,13 +518,13 @@ export class KnowledgeGraphManager {
       return { entities: [], relations: [] };
     }
 
-    const entityIds = new Set(allEntities.map((e) => e.id));
+    const entityIds = allEntities.map((e) => e.id);
     const entityNames = new Set(allEntities.map((e) => e.name));
 
     const { data: observations } = await this.supabase
       .from("observations")
       .select("entity_id, content")
-      .in("entity_id", Array.from(entityIds));
+      .in("entity_id", entityIds);
 
     const entityMap = new Map<number, { name: string; entityType: string; observations: string[] }>(
       allEntities.map((e) => [e.id, { name: e.name, entityType: e.entity_type, observations: [] }])
@@ -487,7 +539,9 @@ export class KnowledgeGraphManager {
 
     const { data: relations } = await this.supabase
       .from("relations")
-      .select("from_entity_id, to_entity_id, relation_type");
+      .select("from_entity_id, to_entity_id, relation_type")
+      .in("from_entity_id", entityIds)
+      .in("to_entity_id", entityIds);
 
     const idToName = new Map<number, string>(allEntities.map((e) => [e.id, e.name]));
 
@@ -509,22 +563,27 @@ export class KnowledgeGraphManager {
   }
 
   public async openNodes(names: string[]): Promise<KnowledgeGraph> {
+    if (names.length === 0) {
+      return { entities: [], relations: [] };
+    }
+
+    const ilikeFilters = names.map((n) => `name.ilike.%${escapeLikePattern(n)}%`).join(",");
     const { data: entities } = await this.supabase
       .from("entities")
       .select("id, name, entity_type")
-      .in("name", names);
+      .or(ilikeFilters);
 
     if (entities === null || entities.length === 0) {
       return { entities: [], relations: [] };
     }
 
-    const entityIds = new Set(entities.map((e) => e.id));
+    const entityIds = entities.map((e) => e.id);
     const entityNames = new Set(entities.map((e) => e.name));
 
     const { data: observations } = await this.supabase
       .from("observations")
       .select("entity_id, content")
-      .in("entity_id", Array.from(entityIds));
+      .in("entity_id", entityIds);
 
     const entityMap = new Map<number, { name: string; entityType: string; observations: string[] }>(
       entities.map((e) => [e.id, { name: e.name, entityType: e.entity_type, observations: [] }])
@@ -539,7 +598,9 @@ export class KnowledgeGraphManager {
 
     const { data: relations } = await this.supabase
       .from("relations")
-      .select("from_entity_id, to_entity_id, relation_type");
+      .select("from_entity_id, to_entity_id, relation_type")
+      .in("from_entity_id", entityIds)
+      .in("to_entity_id", entityIds);
 
     const idToName = new Map<number, string>(entities.map((e) => [e.id, e.name]));
 

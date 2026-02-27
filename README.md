@@ -12,6 +12,7 @@ A knowledge graph memory server for the [Model Context Protocol (MCP)](https://m
 - **Works with any MCP client** — Claude Desktop, TypingMind, Cursor, and more
 - **Free tier friendly** — Supabase's free tier works great for personal use
 - **Cloud-native** — Managed Postgres with automatic backups, no self-hosting required
+- **Composable** — Use as a standalone server or as a library in your own MCP server
 
 ## Quick Start
 
@@ -40,18 +41,16 @@ This creates:
 ### 4. Install & Run
 
 ```bash
-# Clone or download this repo
-git clone https://github.com/kaspnilsson/mcp-memory-supabase.git
-cd mcp-memory-supabase
-
-# Install dependencies and build
-npm install
-npm run build
-
-# Run with environment variables
+# Run directly with npx
 SUPABASE_URL=https://your-project.supabase.co \
 SUPABASE_KEY=your-service-role-key \
-node dist/index.js
+npx @kaspnilsson/mcp-memory-supabase
+
+# Or install globally
+npm install -g @kaspnilsson/mcp-memory-supabase
+SUPABASE_URL=https://your-project.supabase.co \
+SUPABASE_KEY=your-service-role-key \
+mcp-memory-supabase
 ```
 
 ## Configuration
@@ -82,8 +81,8 @@ Add to your MCP client configuration:
 {
   "mcpServers": {
     "memory": {
-      "command": "node",
-      "args": ["/path/to/mcp-memory-supabase/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@kaspnilsson/mcp-memory-supabase"],
       "env": {
         "SUPABASE_URL": "https://<project-ref>.supabase.co",
         "SUPABASE_KEY": "<service-role-key>",
@@ -108,7 +107,7 @@ Add to your MCP client configuration:
 | `delete_relations` | Delete specific relations |
 | `read_graph` | Read entire knowledge graph |
 | `search_nodes` | Search entities by query (semantic or text) |
-| `open_nodes` | Get specific entities by name |
+| `open_nodes` | Get specific entities by name (case-insensitive) |
 
 ## Data Model
 
@@ -133,6 +132,49 @@ Add to your MCP client configuration:
 - **Entities** are nodes in your knowledge graph (people, projects, concepts, etc.)
 - **Observations** are facts/notes attached to entities
 - **Relations** connect entities with typed relationships
+
+## Using as a Library
+
+This package exports a composable API for building custom MCP servers:
+
+```typescript
+import { createMemoryServer } from "@kaspnilsson/mcp-memory-supabase";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+// Create server with custom options
+const { server, manager } = createMemoryServer({
+  supabaseUrl: process.env.SUPABASE_URL,
+  supabaseKey: process.env.SUPABASE_KEY,
+  embeddingApiKey: process.env.EMBEDDING_API_KEY,
+  serverName: "my-custom-memory-server",
+  serverVersion: "1.0.0",
+  // Custom logger (any object with debug/info/warn/error methods)
+  logger: {
+    debug: (msg, data) => console.debug(msg, data),
+    info: (msg, data) => console.info(msg, data),
+    warn: (msg, data) => console.warn(msg, data),
+    error: (msg, data) => console.error(msg, data),
+  },
+});
+
+// Optionally add your own tools
+server.tool("my_custom_tool", { /* schema */ }, async (args) => {
+  // Use manager to interact with the knowledge graph
+  const graph = await manager.searchNodes(args.query);
+  return { content: [{ type: "text", text: JSON.stringify(graph) }] };
+});
+
+// Connect
+await server.connect(new StdioServerTransport());
+```
+
+### Import Paths
+
+| Import | Exports |
+|--------|---------|
+| `@kaspnilsson/mcp-memory-supabase` | `createMemoryServer()` |
+| `@kaspnilsson/mcp-memory-supabase/manager` | `KnowledgeGraphManager` class |
+| `@kaspnilsson/mcp-memory-supabase/types` | `Entity`, `Relation`, `KnowledgeGraph`, `Logger`, etc. |
 
 ## Troubleshooting
 

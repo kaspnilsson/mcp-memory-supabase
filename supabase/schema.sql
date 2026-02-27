@@ -36,6 +36,7 @@ alter table relations enable row level security;
 -- RLS Policies: Allow all access
 -- These policies permit all operations for authenticated/service role users
 -- Service role keys bypass RLS by default, but policies are required by Supabase
+-- For multi-tenant use, replace these with user-scoped policies
 create policy "Allow all access" on entities
   for all using (true) with check (true);
 
@@ -45,11 +46,25 @@ create policy "Allow all access" on observations
 create policy "Allow all access" on relations
   for all using (true) with check (true);
 
+-- Trigger to auto-update updated_at timestamp
+create or replace function update_updated_at_column()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+create trigger update_entities_updated_at
+  before update on entities
+  for each row
+  execute function update_updated_at_column();
+
 -- Vector similarity search index (HNSW)
 create index if not exists idx_entities_embedding 
   on entities using hnsw (embedding vector_cosine_ops);
 
--- Full-text search indexes for fallback
+-- Full-text search indexes for fallback text search
 create index if not exists idx_entities_name_fts 
   on entities using gin(to_tsvector('english', name));
 create index if not exists idx_observations_content_fts 
@@ -79,49 +94,5 @@ begin
   where e.embedding is not null
   order by e.embedding <=> query_embedding
   limit match_count;
-end;
-$$;
-
--- Function to get entity with all data
-create or replace function get_entity_with_data(entity_name text)
-returns json
-language plpgsql
-as $$
-declare
-  result json;
-begin
-  select json_build_object(
-    'entity', row_to_json(e.*),
-    'observations', coalesce(
-      (select json_agg(row_to_json(o.*)) 
-       from observations o 
-       where o.entity_id = e.id),
-      '[]'::json
-    ),
-    'relations_from', coalesce(
-      (select json_agg(json_build_object(
-        'relation_type', r.relation_type,
-        'to_entity', e2.name
-      ))
-       from relations r 
-       join entities e2 on e2.id = r.to_entity_id
-       where r.from_entity_id = e.id),
-      '[]'::json
-    ),
-    'relations_to', coalesce(
-      (select json_agg(json_build_object(
-        'relation_type', r.relation_type,
-        'from_entity', e1.name
-      ))
-       from relations r 
-       join entities e1 on e1.id = r.from_entity_id
-       where r.to_entity_id = e.id),
-      '[]'::json
-    )
-  ) into result
-  from entities e
-  where lower(e.name) = lower(entity_name);
-  
-  return result;
 end;
 $$;

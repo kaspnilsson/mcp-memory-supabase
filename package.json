@@ -1,10 +1,24 @@
 {
   "name": "@kaspnilsson/mcp-memory-supabase",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "MCP Knowledge Graph Memory Server with Supabase + pgvector for semantic search",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./manager": {
+      "types": "./dist/manager.d.ts",
+      "import": "./dist/manager.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
   "bin": {
     "mcp-memory-supabase": "dist/index.js"
   },
