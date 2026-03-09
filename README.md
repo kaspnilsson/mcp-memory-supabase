@@ -5,6 +5,16 @@
 
 A knowledge graph memory server for the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) backed by Supabase with pgvector for semantic search.
 
+## Comparison
+
+| Feature | Official SQLite MCP | Managed Postgres (Supabase/Neon) | Vector-Only DB (Pinecone/Qdrant) |
+| :--- | :--- | :--- | :--- |
+| **Storage** | Local File | **Managed SQL + pgvector** | Vector-only (No Relational) |
+| **Sync** | None (Local only) | **Instant Cloud-native Sync** | API-bound |
+| **Structure** | None (Raw blobs) | **Structured Graphs (Relational)** | Vector fragments (Raw) |
+| **Setup Cost** | Zero | **Low** | Medium |
+| **Portability** | File-bound | **Any Postgres Instance** | DB-locked |
+
 ## Why This?
 
 - **Own your AI's memory** — Your knowledge graph lives in your own Supabase database, not on someone else's servers
