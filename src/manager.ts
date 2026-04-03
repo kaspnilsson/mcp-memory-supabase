@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { Entity, Relation, KnowledgeGraph, SearchMatch, Logger, createDefaultLogger } from "./types.js";
+import { Entity, Relation, KnowledgeGraph, SearchMatch, Logger, createDefaultLogger, ObservationInput } from "./types.js";
 
 interface MatchResult {
   id: number;
@@ -75,7 +75,8 @@ export class KnowledgeGraphManager {
     const errors: string[] = [];
 
     for (const entity of entities) {
-      const text = `${entity.name}: ${entity.observations.join(". ")}`;
+      const obsStrings = entity.observations.map(o => typeof o === "string" ? o : o.content);
+      const text = `${entity.name}: ${obsStrings.join(". ")}`;
       const embedding = await this.getEmbedding(text);
 
       const { data, error } = await this.supabase
@@ -84,6 +85,7 @@ export class KnowledgeGraphManager {
           {
             name: entity.name,
             entity_type: entity.entityType,
+            description: entity.description,
             embedding,
           },
           { onConflict: "name", ignoreDuplicates: false }
@@ -104,14 +106,23 @@ export class KnowledgeGraphManager {
           .eq("entity_id", data.id);
 
         const existingContents = new Set((existing ?? []).map((o) => o.content));
-        const newObservations = entity.observations.filter((o) => !existingContents.has(o));
+        
+        const newObservations = entity.observations.filter(o => {
+          const content = typeof o === "string" ? o : o.content;
+          return !existingContents.has(content);
+        });
 
         if (newObservations.length > 0) {
           const { error: obsError } = await this.supabase.from("observations").insert(
-            newObservations.map((content) => ({
-              entity_id: data.id,
-              content,
-            }))
+            newObservations.map((o) => {
+              const content = typeof o === "string" ? o : o.content;
+              const memory_type = typeof o === "string" ? undefined : o.memoryType;
+              return {
+                entity_id: data.id,
+                content,
+                ...(memory_type ? { memory_type } : {})
+              };
+            })
           );
           if (obsError !== null) {
             this.logger.warn("Failed to insert observations", { entityId: data.id, error: obsError.message });
@@ -127,6 +138,7 @@ export class KnowledgeGraphManager {
       created.push({
         name: entity.name,
         entityType: entity.entityType,
+        description: entity.description,
         observations: (obs ?? []).map((o) => o.content),
       });
     }
@@ -185,7 +197,7 @@ export class KnowledgeGraphManager {
   }
 
   public async addObservations(
-    observations: { entityName: string; contents: string[] }[]
+    observations: { entityName: string; contents: (string | ObservationInput)[] }[]
   ): Promise<{ entityName: string; addedObservations: string[] }[]> {
     const results: { entityName: string; addedObservations: string[] }[] = [];
 
@@ -206,14 +218,22 @@ export class KnowledgeGraphManager {
         .eq("entity_id", entity.id);
 
       const existingContents = new Set((existing ?? []).map((o) => o.content));
-      const newObservations = obs.contents.filter((c) => !existingContents.has(c));
+      const newObservations = obs.contents.filter((c) => {
+        const content = typeof c === "string" ? c : c.content;
+        return !existingContents.has(content);
+      });
 
       if (newObservations.length > 0) {
         const { error: insertError } = await this.supabase.from("observations").insert(
-          newObservations.map((content) => ({
-            entity_id: entity.id,
-            content,
-          }))
+          newObservations.map((c) => {
+            const content = typeof c === "string" ? c : c.content;
+            const memory_type = typeof c === "string" ? undefined : c.memoryType;
+            return {
+              entity_id: entity.id,
+              content,
+              ...(memory_type ? { memory_type } : {})
+            };
+          })
         );
 
         if (insertError !== null) {
@@ -242,7 +262,7 @@ export class KnowledgeGraphManager {
 
       results.push({
         entityName: obs.entityName,
-        addedObservations: newObservations,
+        addedObservations: newObservations.map(c => typeof c === "string" ? c : c.content),
       });
     }
 
@@ -620,4 +640,80 @@ export class KnowledgeGraphManager {
       relations: filteredRelations,
     };
   }
+}
+
+export async function generateDigest(supabase: SupabaseClient, budget = 150): Promise<string> {
+  const pinnedTypes = ["Person", "Preference", "Goal"];
+  const pinnedCap = 50;
+
+  const { data: pinned } = await supabase
+    .from("entities")
+    .select("id, name, entity_type, description, updated_at")
+    .in("entity_type", pinnedTypes)
+    .order("updated_at", { ascending: false })
+    .limit(pinnedCap);
+
+  const remaining = budget - (pinned?.length ?? 0);
+  const { data: recent } = await supabase
+    .from("entities")
+    .select("id, name, entity_type, description, updated_at")
+    .not("entity_type", "in", `(${pinnedTypes.map(t => `'${t}'`).join(",")})`)
+    .order("updated_at", { ascending: false })
+    .limit(remaining);
+
+  const allEntities = [...(pinned ?? []), ...(recent ?? [])];
+  if (allEntities.length === 0) {
+    return "Graph is empty.";
+  }
+
+  const idsWithoutDesc = allEntities.filter(e => !e.description).map(e => e.id);
+  const firstObsMap = new Map<number, string>();
+  
+  if (idsWithoutDesc.length > 0) {
+    const { data: firstObs } = await supabase
+      .from("observations")
+      .select("entity_id, content")
+      .in("entity_id", idsWithoutDesc)
+      .order("created_at", { ascending: true }); // get oldest first
+      
+    // Map just one observation per entity
+    for (const obs of firstObs ?? []) {
+      if (!firstObsMap.has(obs.entity_id)) {
+        firstObsMap.set(obs.entity_id, obs.content);
+      }
+    }
+  }
+
+  // Group by type
+  const grouped = new Map<string, typeof allEntities>();
+  for (const e of allEntities) {
+    const type = e.entity_type;
+    if (!grouped.has(type)) {
+      grouped.set(type, []);
+    }
+    grouped.get(type)!.push(e);
+  }
+
+  const lines: string[] = [];
+  
+  for (const [type, items] of grouped.entries()) {
+    lines.push(`## ${type}s (${items.length})`);
+    for (const e of items) {
+      let desc = e.description || firstObsMap.get(e.id) || "No description";
+      // Truncate desc if very long
+      if (desc.length > 100) desc = desc.slice(0, 97) + "...";
+      
+      const updatedDate = new Date(e.updated_at).toISOString().split('T')[0];
+      lines.push(`- **${e.name}** — ${desc} (${updatedDate})`);
+    }
+    lines.push("");
+  }
+
+  const { count: entityCount } = await supabase.from("entities").select("*", { count: "exact", head: true });
+  const { count: obsCount } = await supabase.from("observations").select("*", { count: "exact", head: true });
+  const { count: relCount } = await supabase.from("relations").select("*", { count: "exact", head: true });
+
+  lines.push(`Graph contains ${entityCount ?? 0} entities, ${obsCount ?? 0} observations, ${relCount ?? 0} relations. Last extraction: ${new Date().toISOString()}`);
+
+  return lines.join("\n");
 }

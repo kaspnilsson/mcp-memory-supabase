@@ -1,7 +1,13 @@
+export interface ObservationInput {
+  content: string;
+  memoryType?: 'user' | 'feedback' | 'project' | 'reference' | string;
+}
+
 export interface Entity {
   name: string;
   entityType: string;
-  observations: string[];
+  description?: string;
+  observations: (string | ObservationInput)[];
 }
 
 export interface Relation {

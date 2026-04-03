@@ -6,6 +6,7 @@ import { Entity, Relation, Logger, MemoryServerOptions, createDefaultLogger } fr
 const EntitySchema = z.object({
   name: z.string().describe("The name of the entity"),
   entityType: z.string().describe("The type of the entity"),
+  description: z.string().optional().describe("A short description of the entity"),
   observations: z.array(z.string()).describe("An array of observation contents associated with the entity"),
 });
 
