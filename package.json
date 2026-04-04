@@ -1,6 +1,6 @@
 {
   "name": "@kaspnilsson/mcp-memory-supabase",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP Knowledge Graph Memory Server with Supabase + pgvector for semantic search",
   "type": "module",
   "main": "dist/index.js",
